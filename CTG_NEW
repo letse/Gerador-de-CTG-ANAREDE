@@ -1,0 +1,434 @@
+npm install next react react-dom
+
+"use client";
+
+import React, { useEffect, useMemo, useRef, useState } from "react";
+
+/* ============================================================================
+   Gerador Avançado de CTGs — FINAL
+   - Nome da CTG = linha entre aspas (Organon)
+   - Linhas técnicas = BRANCH <de> <para> <circuito> (1–5 dígitos) até encontrar END
+   - Suporta simples/dupla/tripla (N linhas por CTG)
+   - Exporta DCTG ANAREDE com colunas fixas e fechamento 99999
+   - Exporta CSV de conferência
+   ========================================================================== */
+
+/* -------------------- Tipos -------------------- */
+type ElementoLinha = {
+  de: string;
+  para: string;
+  tensaoKV?: number | null;
+  circuito?: number | null;
+};
+type Contingencia = {
+  id: number;
+  nome: string;
+  tipo: "Linha" | "Barra" | "Trafo" | "Geracao" | "Outro";
+  barras: string[];
+  linhas: ElementoLinha[];
+  area?: string | null;
+  tensoes?: number[];
+  selecionada: boolean;
+  bruto?: string;
+};
+
+/* -------------------- Regex (parser) -------------------- */
+// Nome da CTG entre aspas (simples ou dupla). Captura conteúdo interno.
+const RGX_CTGNOME = /^\s*['"]\s*(.*?)\s*['"]\s*$/;
+// BRANCH DE PARA CIRCUITO — 1..5 dígitos p/ barras e 1..2 p/ circuito
+const RGX_BRANCH_ORGANON = /^\s*BRANCH\s+(\d{1,5})\s+(\d{1,5})\s+(\d{1,2})\s*$/i;
+// END do bloco
+const RGX_END = /^\s*END\b/i;
+// (opcional) detecção livre de UF/kV para contexto
+const RGX_AREA =
+  /\b(AC|AL|AP|AM|BA|CE|DF|ES|GO|MA|MG|MS|MT|PA|PB|PE|PI|PR|RJ|RN|RO|RR|RS|SC|SE|SP)\b/i;
+const RGX_TENSAO_G = /(\d{2,4})\s*k?V\b/gi;
+
+const sanitize = (s?: string | null) => (s ?? "").replace(/[\t\r]+/g, " ").trim();
+
+/* -------------------- Parser Organon (blocos até END) -------------------- */
+function parseOrganonCTG(text: string): Contingencia[] {
+  const linhas = text.replace(/\r\n?/g, "\n").split(/\n/).map((s) => s.trimEnd());
+  const ctgs: Contingencia[] = [];
+
+  let areaCtx: string | null = null;
+  let kvCtx: number | null = null;
+  let atual: Contingencia | null = null;
+
+  for (const raw of linhas) {
+    const line = sanitize(raw);
+    if (!line) continue;
+
+    // Ignorar separadores/comentários usuais do Organon
+    if (/^!/.test(line) || /^=+$/.test(line) || /^-+$/.test(line)) continue;
+
+    // Encerramento explícito do bloco
+    if (RGX_END.test(line)) {
+      atual = null;
+      continue;
+    }
+
+    // Início de CTG: nome entre aspas
+    const mn = line.match(RGX_CTGNOME);
+    if (mn) {
+      const nome = (mn[1] || "CONTINGENCIA").replace(/\s+/g, " ").trim();
+      atual = {
+        id: ctgs.length,
+        nome,
+        tipo: "Linha",
+        barras: [],
+        linhas: [],
+        area: areaCtx || null,
+        tensoes: kvCtx ? [kvCtx] : [],
+        selecionada: true,
+        bruto: line,
+      };
+      ctgs.push(atual);
+      continue;
+    }
+
+    // (opcional) contexto de área / kV se aparecer em qualquer linha
+    const a = line.match(RGX_AREA);
+    if (a) areaCtx = a[1].toUpperCase();
+    const tens = Array.from(line.matchAll(RGX_TENSAO_G)).map((m) => Number(m[1]));
+    if (tens.length) kvCtx = tens[0];
+
+    // Linha técnica BRANCH
+    const mb = line.match(RGX_BRANCH_ORGANON);
+    if (mb) {
+      // Se por acaso um BRANCH vier antes do nome, abre um bloco anônimo
+      if (!atual) {
+        atual = {
+          id: ctgs.length,
+          nome: "CONTINGENCIA",
+          tipo: "Linha",
+          barras: [],
+          linhas: [],
+          area: areaCtx || null,
+          tensoes: kvCtx ? [kvCtx] : [],
+          selecionada: true,
+          bruto: line,
+        };
+        ctgs.push(atual);
+      }
+      const [, de, para, circ] = mb;
+      atual.linhas.push({
+        de,
+        para,
+        tensaoKV: kvCtx ?? null,
+        circuito: Number(circ),
+      });
+      continue;
+    }
+
+    // Outras linhas fora do padrão: ignorar
+  }
+
+  return ctgs;
+}
+
+/* -------------------- Helpers (colunas fixas) -------------------- */
+function fw(s: string | number, width: number, align: "left" | "right" = "right") {
+  const t = String(s ?? "");
+  if (t.length >= width) return t.slice(0, width);
+  return align === "right" ? t.padStart(width, " ") : t.padEnd(width, " ");
+}
+function center(s: string, width: number) {
+  const t = (s ?? "").slice(0, width);
+  const pad = Math.max(0, width - t.length);
+  const left = Math.floor(pad / 2);
+  const right = pad - left;
+  return " ".repeat(left) + t + " ".repeat(right);
+}
+const CABEC_COLUNAS =
+  "(Tp) (El ) (Pa ) Nc (Ext) (DV1) (DV2) (DV3) (DV4) (DV5) (DV6) (DV7) Gr Und";
+
+/* -------------------- Exportador DCTG (colunas fixas + N linhas) -------------------- */
+function gerarDeckDCTG(ctgs: Contingencia[]) {
+  const out: string[] = [];
+  out.push("DCTG");
+
+  const lista = ctgs.filter((c) => c.selecionada);
+
+  lista.forEach((c, idx) => {
+    const nome = (c.nome || "IDENTIFICACAO DA CONTINGENCIA").replace(/\s+/g, " ").trim();
+
+    // (Nc) O Pr ( <nome centrado em 45 colunas> )
+    out.push(`(Nc) O Pr (${center(nome, 45)})`);
+
+    // Linha meta: "  N  A  1 <nome exato>"  (N = 1,2,3...)
+    // Usa largura 3 para o número N, para ficar como "␠␠1", "␠␠2", etc.
+    out.push(`${fw(idx + 1, 3)}  ${fw("A", 1, "left")}  ${fw(1, 2)} ${nome}`);
+
+    // Cabeçalho
+    out.push("(Tp) (El ) (Pa ) Nc (Ext) (DV1) (DV2) (DV3) (DV4) (DV5) (DV6) (DV7) Gr Und");
+
+    // CIRD(s) — colunas fixas: 2 espaços entre campos; DE(5) PARA(5) CIRC(2)
+    c.linhas.forEach((l) => {
+      const de   = fw(l.de, 5);
+      const para = fw(l.para, 5);
+      const circ = fw(l.circuito ?? 1, 2);
+      out.push(`CIRD ${de} ${para} ${circ}`);
+    });
+
+    // Fim da CTG
+    out.push("FCAS");
+  });
+
+  // Fechamento do deck
+  out.push("99999");
+  return out.join("\n");
+}
+
+/* -------------------- CSV (conferência) -------------------- */
+const escapeCSV = (s: string) => (/[";\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s);
+function gerarCSV(ctgs: Contingencia[]) {
+  const header = ["id", "nome", "tipo", "area", "kV", "linhas"].join(";");
+  const rows = ctgs
+    .filter((c) => c.selecionada)
+    .map((c) => {
+      const tens = (c.tensoes || []).join(",");
+      const linhas = c.linhas
+        .map((l) => `${l.de}-${l.para}-c${l.circuito ?? ""}`)
+        .join(",");
+      return [c.id, escapeCSV(c.nome), c.tipo, c.area ?? "", tens, escapeCSV(linhas)].join(";");
+    });
+  return [header, ...rows].join("\n");
+}
+
+/* -------------------- Util: download -------------------- */
+function download(filename: string, text: string, mime = "text/plain;charset=utf-8") {
+  const blob = new Blob([text], { type: mime });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+}
+
+/* -------------------- Página -------------------- */
+export default function Page() {
+  const [ctgs, setCtgs] = useState<Contingencia[]>([]);
+  const [arquivo, setArquivo] = useState<File | null>(null);
+  const [busca, setBusca] = useState("");
+  const dropRef = useRef<HTMLDivElement | null>(null);
+
+  // leitura do arquivo
+  const onFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      setArquivo(file);
+      handleFileRead(file);
+    }
+  };
+  function handleFileRead(file: File) {
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const text = (ev.target?.result as string) || "";
+        setCtgs(parseOrganonCTG(text));
+      } catch (e: any) {
+        alert("Erro ao ler o arquivo: " + (e?.message || e));
+      }
+    };
+    reader.readAsText(file);
+  }
+
+  // drag&drop
+  useEffect(() => {
+    const el = dropRef.current;
+    if (!el) return;
+    const prevent = (e: DragEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+    };
+    const handleDrop = (e: DragEvent) => {
+      prevent(e);
+      const f = e.dataTransfer?.files?.[0];
+      if (f) {
+        setArquivo(f);
+        handleFileRead(f);
+      }
+    };
+    el.addEventListener("dragover", prevent);
+    el.addEventListener("drop", handleDrop);
+    return () => {
+      el.removeEventListener("dragover", prevent);
+      el.removeEventListener("drop", handleDrop);
+    };
+  }, []);
+
+  // filtro & seleção
+  const filtered = useMemo(() => {
+    const q = busca.toLowerCase();
+    return ctgs.filter(
+      (c) =>
+        !q ||
+        c.nome.toLowerCase().includes(q) ||
+        (c.bruto || "").toLowerCase().includes(q)
+    );
+  }, [ctgs, busca]);
+
+  const anySelected = filtered.some((c) => c.selecionada);
+  const toggleOne = (id: number) =>
+    setCtgs((prev) =>
+      prev.map((c) => (c.id === id ? { ...c, selecionada: !c.selecionada } : c))
+    );
+  const toggleVisible = (value: boolean) => {
+    const ids = new Set(filtered.map((c) => c.id));
+    setCtgs((prev) =>
+      prev.map((c) => (ids.has(c.id) ? { ...c, selecionada: value } : c))
+    );
+  };
+
+  // exportações
+  const onExportDCTG = () => {
+    const chosen = ctgs.filter((c) => c.selecionada);
+    if (!chosen.length) return alert("Selecione ao menos uma contingência.");
+    download("CTG_ANAREDE_DCTG.dat", gerarDeckDCTG(chosen));
+  };
+  const onExportCSV = () => {
+    const chosen = ctgs.filter((c) => c.selecionada);
+    if (!chosen.length) return alert("Selecione ao menos uma contingência.");
+    download("CTG_resumo.csv", gerarCSV(chosen), "text/csv;charset=utf-8");
+  };
+
+  return (
+    <main className="min-h-screen w-full bg-gray-100 p-6">
+      <div className="w-full max-w-6xl mx-auto bg-white rounded-2xl shadow-xl border">
+        <div className="p-5 border-b bg-gray-50 rounded-t-2xl flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+          <h1 className="text-2xl font-bold">Gerador de CTG — ANAREDE (DCTG)</h1>
+          <div className="flex gap-2">
+            <button
+              className="h-10 px-3 rounded-md border bg-white disabled:opacity-50"
+              onClick={onExportCSV}
+              disabled={!anySelected}
+              title="Exporta CSV com as CTGs selecionadas"
+            >
+              Exportar CSV
+            </button>
+            <button
+              className="h-10 px-3 rounded-md border bg-gray-900 text-white disabled:opacity-50"
+              onClick={onExportDCTG}
+              disabled={!anySelected}
+              title="Exporta o deck DCTG com colunas fixas"
+            >
+              Exportar DCTG (.dat)
+            </button>
+          </div>
+        </div>
+
+        <div className="p-5">
+          <div
+            ref={dropRef}
+            className="border-2 border-dashed rounded-xl p-6 bg-gray-50 mb-4 flex flex-col gap-3 items-center text-center"
+          >
+            <div className="text-sm text-gray-600">
+              Arraste o arquivo CTG (Organon) aqui ou selecione abaixo
+            </div>
+            <input
+              type="file"
+              accept=".ctg,.txt"
+              onChange={onFileInput}
+              className="max-w-sm text-sm"
+            />
+            {arquivo && (
+              <div className="text-xs text-gray-500">
+                Carregado: <b>{arquivo.name}</b>
+              </div>
+            )}
+          </div>
+
+          {ctgs.length === 0 && (
+            <div className="text-sm text-gray-600 p-4 bg-white rounded-xl border">
+              Nenhum CTG carregado ainda.
+            </div>
+          )}
+
+          {ctgs.length > 0 && (
+            <>
+              <div className="flex items-center gap-2 mb-3">
+                <input
+                  className="h-10 px-3 rounded-md border w-full bg-white text-sm"
+                  placeholder="Buscar por nome ou texto..."
+                  value={busca}
+                  onChange={(e) => setBusca(e.target.value)}
+                />
+                <span className="text-xs px-2 py-1 border rounded-md bg-gray-50">
+                  CTGs: {ctgs.length}
+                </span>
+                <span className="text-xs px-2 py-1 border rounded-md bg-gray-50">
+                  Filtradas: {filtered.length}
+                </span>
+                <button
+                  className="h-9 px-3 rounded-md border bg-white"
+                  onClick={() => toggleVisible(true)}
+                  disabled={filtered.length === 0}
+                >
+                  Selecionar visíveis
+                </button>
+                <button
+                  className="h-9 px-3 rounded-md border bg-white"
+                  onClick={() => toggleVisible(false)}
+                  disabled={filtered.length === 0}
+                >
+                  Desmarcar visíveis
+                </button>
+              </div>
+
+              <div className="max-h-[520px] overflow-auto border rounded-lg bg-white">
+                <table className="w-full table-auto border-collapse text-sm">
+                  <thead className="sticky top-0 bg-gray-50 z-10">
+                    <tr>
+                      <th className="p-2 border">Sel.</th>
+                      <th className="p-2 border text-left">Nome</th>
+                      <th className="p-2 border">Tipo</th>
+                      <th className="p-2 border">Área</th>
+                      <th className="p-2 border">kV</th>
+                      <th className="p-2 border text-left">Linhas detectadas</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filtered.map((c) => (
+                      <tr key={c.id} className="hover:bg-gray-50">
+                        <td className="p-2 border text-center">
+                          <input
+                            type="checkbox"
+                            checked={c.selecionada}
+                            onChange={() => toggleOne(c.id)}
+                          />
+                        </td>
+                        <td className="p-2 border font-medium">{c.nome}</td>
+                        <td className="p-2 border text-center">{c.tipo}</td>
+                        <td className="p-2 border text-center">{c.area || ""}</td>
+                        <td className="p-2 border text-center">
+                          {(c.tensoes || []).join(", ")}
+                        </td>
+                        <td className="p-2 border">
+                          {c.linhas.length ? (
+                            c.linhas.map((l, i) => (
+                              <div key={i}>
+                                {l.de} - {l.para}
+                                {typeof l.circuito === "number" ? ` (c${l.circuito})` : ""}
+                              </div>
+                            ))
+                          ) : (
+                            <span className="text-gray-400">—</span>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="text-[11px] text-gray-500 mt-3">
+                <b>Obs.:</b> caso seu manual use larguras diferentes, é só me enviar
+                que eu ajusto rapidamente os tamanhos do `fw(...)`/`center(...)`.
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </main>
+  );
+}
